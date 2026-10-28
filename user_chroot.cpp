@@ -1,138 +1,191 @@
-// references:
-// [1]: http://man7.org/linux/man-pages/man7/user_namespaces.7.html
-// [2]: http://man7.org/linux/man-pages/man2/unshare.2.html
-
 #include <sched.h>
 #include <sys/types.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
 #include <libgen.h>
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
-int main(int argc, char** argv) {
-    if(argc < 2) {
-        printf("Usage: %s <rootfs> <command>\n", argv[0]);
+
+static bool write_file(const char* path, const char* value)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd == -1) {
+        fprintf(stderr, "open(%s): %s\n",
+                path, strerror(errno));
+        return false;
     }
 
-    int uid = getuid();
-    int gid = getgid();
-    printf("Before unshare, uid=%d, gid=%d\n", uid, gid);
+    size_t len = strlen(value);
+    ssize_t n = write(fd, value, len);
 
-    // First, unshare the user namespace and assume admin capability in the
-    // new namespace
-    int err = unshare(CLONE_NEWUSER);
-    if(err) {
-        printf("Failed to unshare user namespace\n");
+    if (n != static_cast<ssize_t>(len)) {
+        int saved_errno = (n == -1) ? errno : EIO;
+
+        fprintf(stderr, "write(%s): %s\n",
+                path, strerror(saved_errno));
+
+        close(fd);
+        return false;
+    }
+
+    if (close(fd) == -1) {
+        fprintf(stderr, "close(%s): %s\n",
+                path, strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+static bool write_id_map(
+    const char* map_name,
+    uid_t inside_id,
+    unsigned int outside_id)
+{
+    char path[128];
+    char mapping[128];
+
+    snprintf(path, sizeof(path),
+             "/proc/self/%s", map_name);
+
+    snprintf(mapping, sizeof(mapping),
+             "%u %u 1\n",
+             static_cast<unsigned int>(inside_id),
+             outside_id);
+
+    return write_file(path, mapping);
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        fprintf(stderr,
+                "Usage: %s <rootfs> [command [args...]]\n",
+                argv[0]);
         return 1;
     }
 
-    // write a uid/gid map
-    char file_path_buf[100];
-    int pid = getpid();
-    printf("My pid: %d\n", pid);
+    uid_t original_uid = getuid();
+    gid_t original_gid = getgid();
 
-    sprintf(file_path_buf, "/proc/%d/uid_map", pid);
-    int fd = open(file_path_buf, O_WRONLY);
-    if(fd == -1) {
-        printf("Failed to open %s for write [%d] %s\n", file_path_buf, errno, 
-               strerror(errno));
-    } else {
-        printf("Writing : %s (fd=%d)\n", file_path_buf, fd);
-        err = dprintf(fd, "%d %d 1\n", uid, uid);
-        if(err == -1) {
-            printf("Failed to write contents [%d]: %s\n", errno, 
-                   strerror(errno));
-        }
-        close(fd);
-    }
+    printf("Before unshare: uid=%u gid=%u\n",
+           static_cast<unsigned int>(original_uid),
+           static_cast<unsigned int>(original_gid));
 
-    sprintf(file_path_buf, "/proc/%d/setgroups", pid);
-    fd = open(file_path_buf, O_WRONLY);
-    if(fd == -1) {
-        printf("Failed to open %s for write [%d] %s\n", file_path_buf, errno, 
-               strerror(errno));
-    } else {
-        dprintf(fd, "deny\n");
-        close(fd);
-    }
-
-    sprintf(file_path_buf, "/proc/%d/gid_map", pid);
-    fd = open(file_path_buf, O_WRONLY);
-    if(fd == -1) {
-        printf("Failed to open %s for write [%d] %s\n", file_path_buf, errno, 
-               strerror(errno));
-    } else {
-        printf("Writing : %s (fd=%d)\n", file_path_buf, fd);
-        err = dprintf(fd, "%d %d 1\n", gid, gid);
-        if(err == -1) {
-            printf("Failed to write contents [%d]: %s\n", errno, 
-                   strerror(errno));
-        }
-        close(fd);
-    }
-
-    // Now chroot into the desired directory
-    err = chroot(argv[1]);
-    if(err) {
-        printf("Failed to chroot\n");
+    // Create a user namespace and a separate mount namespace.
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == -1) {
+        perror("unshare");
         return 1;
     }
 
-    // Now drop admin in our namespace
-    err = setresuid(uid, uid, uid);
-    if(err) {
-        printf("Failed to set uid\n");
+    printf("User and mount namespaces created.\n");
+
+    // Map namespace UID 0 to the original UID.
+    if (!write_id_map("uid_map", 0, original_uid)) {
+        fprintf(stderr, "Failed to configure UID mapping.\n");
+        return 1;
     }
 
-    err = setresgid(gid, gid, gid);
-    if(err) {
-        printf("Failed to set gid\n");
+    // An unprivileged process normally must disable setgroups
+    // before configuring gid_map.
+    if (!write_file("/proc/self/setgroups", "deny\n")) {
+        fprintf(stderr, "Failed to configure setgroups.\n");
+        return 1;
     }
 
-    // and start a shell
-
-    char* cmd = NULL;
-	char** new_argv = NULL;
-	int args_count = 0;
-
-	if(argc >= 3)
-	{
-		cmd = argv[2];
-		args_count = argc - 3 + 2;
-		new_argv = new char*[args_count];
-		new_argv[0] = basename(cmd);
-		for(int i = 0; i < args_count-1; i++)
-		{
-			new_argv[i+1] = ( (3+i) < argc) ? argv[3+i] : NULL;
-		}
-	}
-	else
-	{
-		args_count = 2;
-		cmd = new char[10];
-		snprintf(cmd, 10, "/bin/bash");
-		new_argv = new char*[2];
-		new_argv[0] = new char[5];
-		snprintf(new_argv[0], 5, "bash");
-	}
-	
-    err = execvp(cmd, new_argv);
-    if(err) {
-        perror("Failed to start shell");
-        return -1;
+    // Map namespace GID 0 to the original GID.
+    if (!write_id_map("gid_map", 0, original_gid)) {
+        fprintf(stderr, "Failed to configure GID mapping.\n");
+        return 1;
     }
 
-	
-	if(argc < 3)
-	{
-		delete [] cmd;
-		for(int i = 0; i < args_count;i++) delete [] new_argv[i];
-	}
-	delete [] new_argv;
+    printf("UID/GID mappings configured.\n");
 
+    // Make mount propagation private so mount operations do not
+    // propagate to the parent mount namespace.
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) {
+        perror("mount(MS_PRIVATE)");
+        return 1;
+    }
+
+    // Validate root filesystem.
+    struct stat st;
+
+    if (stat(argv[1], &st) == -1) {
+        perror("stat(rootfs)");
+        return 1;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Error: rootfs is not a directory.\n");
+        return 1;
+    }
+
+    // Resolve rootfs to an absolute path before changing root.
+    char rootfs[PATH_MAX];
+
+    if (realpath(argv[1], rootfs) == nullptr) {
+        perror("realpath(rootfs)");
+        return 1;
+    }
+
+    // Change the process root.
+    if (chroot(rootfs) == -1) {
+        fprintf(stderr, "chroot(%s): %s\n",
+                rootfs, strerror(errno));
+        return 1;
+    }
+
+    // Move the working directory into the new root.
+    if (chdir("/") == -1) {
+        perror("chdir(/)");
+        return 1;
+    }
+
+    printf("Entered root filesystem.\n");
+
+    // We are namespace root (UID/GID 0), mapped to the original
+    // unprivileged UID/GID outside the namespace.
+    //
+    // Do not switch to original_uid/original_gid here: those
+    // numbers are not necessarily mapped inside this namespace.
+
+    // Construct the command argument vector.
+    char* default_argv[] = {
+        const_cast<char*>("bash"),
+        nullptr
+    };
+
+    char** command_argv;
+
+    if (argc >= 3) {
+        command_argv = &argv[2];
+
+        // Use the executable's basename as argv[0].
+        char* name = basename(argv[2]);
+
+        // Preserve the original argument vector while replacing
+        // only the first argument.
+        command_argv[0] = name;
+    } else {
+        command_argv = default_argv;
+    }
+
+    const char* command =
+        (argc >= 3) ? argv[2] : "/bin/bash";
+
+    execvp(command, command_argv);
+
+    fprintf(stderr, "execvp(%s): %s\n",
+            command, strerror(errno));
+
+    return 1;
 }
